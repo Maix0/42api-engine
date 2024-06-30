@@ -196,6 +196,8 @@ module Apipie
         ret.concat(api_from_routes)
       end
       ret
+    end
+    
     def method_name
       @method
     end
