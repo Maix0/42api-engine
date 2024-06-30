@@ -20,6 +20,7 @@ Gem::Specification.new do |s|
   s.add_development_dependency 'rails', '>= 3.0.20'
   s.add_dependency 'json'
   s.add_dependency 'meta-tags'
+  s.add_dependency 'base64'
   s.add_development_dependency 'minitest'
   s.add_development_dependency 'rdoc'
 
