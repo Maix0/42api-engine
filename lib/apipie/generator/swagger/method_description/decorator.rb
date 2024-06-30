@@ -1,7 +1,7 @@
 class Apipie::Generator::Swagger::MethodDescription::Decorator < SimpleDelegator
   # @return [String]
   def operation_id
-    "#{object.resource.controller.name}__#{object.method}"
+    "#{object.resource.controller.name}__#{__method__}"
   end
 
   # @return [String]
@@ -9,7 +9,7 @@ class Apipie::Generator::Swagger::MethodDescription::Decorator < SimpleDelegator
     if object.blank?
       '<no method>'
     else
-      "#{object.resource.controller.name}##{object.method}"
+      "#{object.resource.controller.name}##{__method__}"
     end
   end
 
