@@ -8,9 +8,11 @@ module Apipie
   class Application
     # we need engine just for serving static assets
     class Engine < Rails::Engine
+      config.active_support.cache_format_version = 7.0
       initializer 'static assets', before: :build_middleware_stack do |app|
         app.middleware.use ::Apipie::StaticDispatcher, "#{root}/app/public"
       end
+
     end
 
     attr_reader :resource_descriptions
