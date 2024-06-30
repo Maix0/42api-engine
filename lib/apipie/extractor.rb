@@ -9,15 +9,18 @@ require 'apipie/extractor/collector'
 class Apipie::Railtie
   initializer 'apipie.extractor' do |app|
     ActiveSupport.on_load :action_controller do
-      before_filter do |controller|
+      before_action do |controller|
         if Apipie.configuration.record
           Apipie::Extractor.call_recorder.analyse_controller(controller)
         end
       end
     end
-    app.middleware.use ::Apipie::Extractor::Recorder::Middleware
-    ActionController::TestCase::Behavior.instance_eval do
-      include Apipie::Extractor::Recorder::FunctionalTestRecording
+
+    if Apipie.configuration.record
+      app.middleware.use ::Apipie::Extractor::Recorder::Middleware
+
+      ActionController::TestCase.send(:prepend, Apipie::Extractor::Recorder::FunctionalTestRecording)
+      ActionController::TestCase::Behavior.send(:prepend, Apipie::Extractor::Recorder::FunctionalTestRecording)
     end
   end
 end
@@ -79,7 +82,7 @@ module Apipie
       def apis_from_routes
         return @apis_from_routes if @apis_from_routes
 
-        @api_prefix = Apipie.api_base_url.sub(/\/$/, '')
+        @api_prefix = Apipie.api_base_url.sub(%r{/$},"")
         populate_api_routes
         update_api_descriptions
 
@@ -150,10 +153,10 @@ module Apipie
       def update_api_descriptions
         apis_from_docs = all_apis_from_docs
         @apis_from_routes.each do |(controller, action), new_apis|
-          method_key = "#{Apipie.get_resource_name(controller.constantize)}##{action}"
+          method_key = "#{Apipie.get_resource_id(controller.safe_constantize || next)}##{action}"
           old_apis = apis_from_docs[method_key] || []
           new_apis.each do |new_api|
-            new_api[:path].sub!(/\(\.:format\)$/, '') if new_api[:path]
+            new_api[:path]&.sub!(/\(\.:format\)$/,"")
             old_api = old_apis.find do |api|
               api[:path] == "#{@api_prefix}#{new_api[:path]}"
             end

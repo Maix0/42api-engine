@@ -1,13 +1,25 @@
 # -*- coding: utf-8 -*-
+
 module Apipie
   module Validator
-    # to create new validator, inherit from Apipie::Validator::Base
+
+    # to create new validator, inherit from Apipie::Validator::BaseValidator
     # and implement class method build and instance method validate
     class BaseValidator
       attr_accessor :param_description
 
       def initialize(param_description)
         @param_description = param_description
+      end
+
+      def inspected_fields
+        [:param_description]
+      end
+
+      def inspect
+        string = "#<#{self.class.name}:#{self.object_id} "
+        fields = inspected_fields.map {|field| "#{field}: #{self.send(field)}"}
+        string << fields.join(", ") << ">"
       end
 
       def self.inherited(subclass)
@@ -22,6 +34,16 @@ module Apipie
           return validator if validator
         end
         nil
+      end
+
+      def self.raise_if_missing_params
+        missing_params = []
+        yield missing_params
+        if missing_params.size > 1
+          raise ParamMultipleMissing.new(missing_params)
+        elsif missing_params.size == 1
+          raise ParamMissing.new(missing_params.first)
+        end
       end
 
       # check if value is valid
@@ -44,6 +66,10 @@ module Apipie
         'TODO: validator description'
       end
 
+      def format_description_value(value)
+        "<code>#{CGI::escapeHTML(value.to_s)}</code>"
+      end
+
       def error
         ParamInvalid.new(param_name, @error_value, description)
       end
@@ -63,12 +89,26 @@ module Apipie
         'string'
       end
 
+      def ignore_allow_blank?
+        false
+      end
+
       def merge_with(other_validator)
-        raise NotImplementedError, "Dont know how to merge #{inspect} with #{other_validator.inspect}"
+        return self if self == other_validator
+        raise NotImplementedError, "Don't know how to merge #{self.inspect} with #{other_validator.inspect}"
       end
 
       def params_ordered
         nil
+      end
+
+      def ==(other)
+        return false unless self.class == other.class
+        if param_description == other.param_description
+          true
+        else
+          false
+        end
       end
     end
 
@@ -91,7 +131,7 @@ module Apipie
       end
 
       def description
-        "Must be #{@type}"
+        "Must be a #{@type}"
       end
 
       def expected_type
@@ -101,6 +141,8 @@ module Apipie
           'array'
         elsif @type.ancestors.include? Numeric
           'numeric'
+        elsif @type.ancestors.include? File
+          'file'
         else
           'string'
         end
@@ -123,7 +165,7 @@ module Apipie
       end
 
       def description
-        "Must match regular expression <code>/#{@regexp.source}/</code>."
+        "Must match regular expression #{format_description_value("/#{@regexp.source}/")}."
       end
     end
 
@@ -142,8 +184,12 @@ module Apipie
         new(param_description, argument) if argument.is_a?(Array)
       end
 
+      def values
+        @array
+      end
+
       def description
-        string = @array.map { |value| "<code>#{value}</code>" }.join(', ')
+        string = @array.map { |value| format_description_value(value) }.join(', ')
         "Must be one of: #{string}."
       end
     end
@@ -194,7 +240,13 @@ module Apipie
 
       def has_valid_type?(value)
         if @items_type
-          value.is_a?(@items_type)
+          item_validator = BaseValidator.find('', @items_type, nil, nil)
+
+          if item_validator
+            item_validator.valid?(value)
+          else
+            value.kind_of?(@items_type)
+          end
         else
           true
         end
@@ -234,7 +286,8 @@ module Apipie
       end
 
       def description
-        "Must be one of: #{@array.join(', ')}."
+        string = @array.map { |value| format_description_value(value) }.join(', ')
+        "Must be one of: #{string}."
       end
     end
 
@@ -286,24 +339,27 @@ module Apipie
       def params_ordered
         @params_ordered ||= _apipie_dsl_data[:params].map do |args|
           options = args.find { |arg| arg.is_a? Hash }
-          options[:parent] = param_description
+          options[:parent] = self.param_description
+          options[:param_group] = @param_group
           Apipie::ParamDescription.from_dsl_data(param_description.method_description, args)
         end
       end
 
       def validate(value)
-        return false unless value.is_a? Hash
-        if @hash_params
-          @hash_params.each do |k, p|
+        return false if !value.is_a? Hash
+
+        BaseValidator.raise_if_missing_params do |missing|
+          @hash_params&.each do |k, p|
             if Apipie.configuration.validate_presence?
-              raise ParamMissing.new(p) if p.required && !value.has_key?(k)
+              missing << p if p.required && !value.key?(k)
             end
             if Apipie.configuration.validate_value?
               p.validate(value[k]) if value.key?(k)
             end
           end
         end
-        true
+
+        return true
       end
 
       def process_value(value)
@@ -361,6 +417,31 @@ module Apipie
       end
     end
 
+    class DecimalValidator < BaseValidator
+
+      def validate(value)
+        self.class.validate(value)
+      end
+
+      def self.build(param_description, argument, options, block)
+        if argument == :decimal
+          self.new(param_description)
+        end
+      end
+
+      def description
+        "Must be a decimal number."
+      end
+
+      def expected_type
+        'numeric'
+      end
+
+      def self.validate(value)
+        value.to_s =~ /\A^[-+]?[0-9]+([,.][0-9]+)?\Z$/
+      end
+    end
+
     class NumberValidator < BaseValidator
       def validate(value)
         self.class.validate(value)
@@ -374,6 +455,10 @@ module Apipie
         'Must be a number.'
       end
 
+      def expected_type
+        'numeric'
+      end
+
       def self.validate(value)
         value.to_s =~ /\A(0|[1-9]\d*)\Z$/
       end
@@ -385,24 +470,33 @@ module Apipie
       end
 
       def self.build(param_description, argument, options, block)
-        if argument == :bool || argument == :boolean
+        if argument == :bool || argument == :boolean || boolean_array?(argument)
           self.new(param_description)
         end
       end
 
-      def expected_type
-        'boolean'
+      private_class_method def self.boolean_array?(argument)
+        argument.is_a?(Array) && (argument - [true, false]) == []
       end
 
       def description
-        "Must be 'true' or 'false' or '1' or '0'"
+        string = %w(true false 1 0).map { |value| format_description_value(value) }.join(', ')
+        "Must be one of: #{string}."
+      end
+
+      def ignore_allow_blank?
+        true
+      end
+
+      def expected_type
+        'boolean'
       end
     end
 
     class NestedValidator < BaseValidator
       def initialize(param_description, argument, param_group)
         super(param_description)
-        @validator = Apipie::Validator:: HashValidator.new(param_description, argument, param_group)
+        @validator = Apipie::Validator::HashValidator.new(param_description, argument, param_group)
         @type = argument
       end
 

@@ -6,8 +6,14 @@ module Apipie
   # required - boolean if required
   # validator - Validator::BaseValidator subclass
   class ParamDescription
-    attr_reader :method_description, :name, :desc, :allow_nil, :validator, :options, :metadata, :show, :as, :validations
+
+    attr_reader :method_description, :name, :desc, :allow_nil, :allow_blank, :validator, :options, :metadata, :show, :as, :validations, :response_only, :request_only
+    attr_reader :additional_properties, :is_array
     attr_accessor :parent, :required
+
+    alias response_only? response_only
+    alias request_only? request_only
+    alias is_array? is_array
 
     def self.from_dsl_data(method_description, args)
       param_name, validator, desc_or_options, options, block = args
@@ -17,6 +23,19 @@ module Apipie
                                    desc_or_options,
                                    options,
                                    &block)
+    end
+
+    def to_s
+      "ParamDescription: #{method_description.id}##{name}"
+    end
+
+    def ==(other)
+      return false unless self.class == other.class
+      if method_description == other.method_description && @options == other.options
+        true
+      else
+        false
+      end
     end
 
     def initialize(method_description, name, validator, desc_or_options = nil, options = {}, &block)
@@ -36,6 +55,10 @@ module Apipie
         @from_concern = @options[:param_group][:from_concern]
       end
 
+      if validator.is_a?(Hash)
+        @options.merge!(validator.select{|k,v| k != :array_of })
+      end
+
       @method_description = method_description
       @name = concern_subst(name)
       @as = options[:as] || @name
@@ -46,38 +69,68 @@ module Apipie
 
       @required = is_required?
 
+      @response_only = (@options[:only_in] == :response)
+      @request_only = (@options[:only_in] == :request)
+      raise ArgumentError.new("'#{@options[:only_in]}' is not a valid value for :only_in") if (!@response_only && !@request_only) && @options[:only_in].present?
+
       @show = if @options.key? :show
-                @options[:show]
-              else
-                true
+        @options[:show]
+      else
+        true
       end
 
       @allow_nil = @options[:allow_nil] || false
+      @allow_blank = @options[:allow_blank] || false
 
       action_awareness
 
       if validator
+        if (validator != Hash) && (validator.is_a? Hash) && (validator[:array_of])
+          @is_array = true
+          validator = validator[:array_of]
+          raise "an ':array_of =>' validator is allowed exclusively on response-only fields" unless @response_only
+        end
         @validator = Validator::BaseValidator.find(self, validator, @options, block)
         raise "Validator for #{validator} not found." unless @validator
       end
 
       @validations = Array(options[:validations]).map {|v| concern_subst(Apipie.markup_to_html(v)) }
+
+      @additional_properties = @options[:additional_properties]
+      @deprecated = @options[:deprecated] || false
     end
 
     def from_concern?
       method_description.from_concern? || @from_concern
     end
 
+    def normalized_value(value)
+      if value.is_a?(ActionController::Parameters) && !value.is_a?(Hash)
+        value.to_unsafe_hash
+      elsif value.is_a? Array
+        value.map { |v| normalized_value (v) }
+      else
+        value
+      end
+    end
+
     def validate(value)
-      return true if @allow_nil && value.nil?
-      if (!@allow_nil && value.nil?) || !@validator.valid?(value)
-        error = @validator.error
+      return true if allow_nil && value.nil?
+      return true if allow_blank && value.blank?
+      value = normalized_value(value)
+      if (!allow_nil && value.nil?) || (blank_forbidden? && value.blank?) || !validator.valid?(value)
+        error = validator.error
         error = ParamError.new(error) unless error.is_a? StandardError
         raise error
       end
     end
 
+    def blank_forbidden?
+      !Apipie.configuration.ignore_allow_blank_false && !allow_blank && !validator.ignore_allow_blank?
+    end
+
     def process_value(value)
+      value = normalized_value(value)
       if @validator.respond_to?(:process_value)
         @validator.process_value(value)
       else
@@ -101,16 +154,25 @@ module Apipie
     end
 
     def to_json(lang = nil)
-      hash = { :name => name.to_s,
-               :full_name => full_name,
-               :description => preformat_text(Apipie.app.translate(@options[:desc], lang)),
-               :required => required,
-               :allow_nil => allow_nil,
-               :validator => validator.to_s,
-               :expected_type => validator.expected_type,
-               :metadata => metadata,
-               :show => show,
-               :validations => validations }
+      hash = {
+        name: name.to_s,
+        full_name: full_name,
+        description: preformat_text(Apipie.app.translate(@options[:desc], lang)),
+        required: required,
+        allow_nil: allow_nil,
+        allow_blank: allow_blank,
+        validator: validator.to_s,
+        expected_type: validator.expected_type,
+        metadata: metadata,
+        show: show,
+        validations: validations,
+        deprecated: deprecated?
+      }
+
+      if deprecation.present?
+        hash[:deprecation] = deprecation.to_json
+      end
+
       if sub_params = validator.params_ordered
         hash[:params] = sub_params.map { |p| p.to_json(lang) }
       end
@@ -126,7 +188,7 @@ module Apipie
       self
     end
 
-    # merge param descripsiont. Allows defining hash params on more places
+    # merge param descriptions. Allows defining hash params on more places
     # (e.g. in param_groups). For example:
     #
     #     def_param_group :user do
@@ -144,6 +206,14 @@ module Apipie
       params.group_by(&:name).map do |_name, param_descs|
         param_descs.reduce(&:merge_with)
       end.sort_by { |param| ordering.index(param.name) }
+    end
+
+    def self.merge(target_params, source_params)
+      params_to_merge, params_to_add = source_params.partition do |source_param|
+        target_params.any? { |target_param| source_param.name == target_param.name }
+      end
+      unify(target_params + params_to_merge)
+      target_params.concat(params_to_add)
     end
 
     # action awareness is being inherited from ancestors (in terms of
@@ -171,15 +241,18 @@ module Apipie
 
     # makes modification that are based on the action that the param
     # is defined for. Typical for required and allow_nil variations in
-    # crate/update actions.
+    # create/update actions.
     def action_awareness
       if action_aware?
-        unless @options.key?(:allow_nil)
-          @allow_nil = if @required
-                         false
-                       else
-                         true
-                       end
+        if !@options.key?(:allow_nil)
+          if @required
+            @allow_nil = false
+          else
+            @allow_nil = true
+          end
+        end
+        if as_action != "create"
+          @required = false
         end
         @required = false if as_action != 'create'
       end
@@ -203,7 +276,7 @@ module Apipie
     end
 
     def is_required?
-      if @options.has_key?(:required)
+      if @options.key?(:required)
         if (@options[:required] == true) || (@options[:required] == false)
           @options[:required]
         else
@@ -214,5 +287,23 @@ module Apipie
       end
     end
 
+    def deprecated?
+      @deprecated.present?
+    end
+
+    def deprecation
+      return if @deprecated.blank? || @deprecated == true
+
+      case @deprecated
+      when Hash
+        Apipie::ParamDescription::Deprecation.new(
+          info: @deprecated[:info],
+          deprecated_in: @deprecated[:in],
+          sunset_at: @deprecated[:sunset]
+        )
+      when String
+        Apipie::ParamDescription::Deprecation.new(info: @deprecated)
+      end
+    end
   end
 end

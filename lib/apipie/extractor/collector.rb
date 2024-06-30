@@ -19,21 +19,21 @@ module Apipie
       def ignore_call?(record)
         return true unless record[:controller]
         return true if @ignored.include?(record[:controller].name)
-        return true if @ignored.include?("#{Apipie.get_resource_name(record[:controller].name)}##{record[:action]}")
+        return true if @ignored.include?("#{Apipie.get_resource_id(record[:controller].name)}##{record[:action]}")
         return true unless @api_controllers_paths.include?(controller_full_path(record[:controller]))
       end
 
       def handle_record(record)
-        add_to_records(record)
         if ignore_call?(record)
           Extractor.logger.info("REST_API: skipping #{record_to_s(record)}")
         else
+          add_to_records(record)
           refine_description(record)
         end
       end
 
       def add_to_records(record)
-        key = "#{Apipie.get_resource_name(record[:controller])}##{record[:action]}"
+        key = "#{Apipie.get_resource_id(record[:controller])}##{record[:action]}"
         @records[key] << record
       end
 
@@ -75,6 +75,10 @@ module Apipie
             if param_desc[:type].first == :number && (key.to_s !~ /id$/ || !Apipie::Validator::NumberValidator.validate(value))
               param_desc[:type].shift
             end
+
+            if param_desc[:type].first == :decimal && (key.to_s !~ /id$/ || !Apipie::Validator::DecimalValidator.validate(value))
+              param_desc[:type].shift
+            end
           end
 
           if value.is_a? Hash
@@ -85,14 +89,14 @@ module Apipie
       end
 
       def finalize_descriptions
-        @descriptions.each do |_method, desc|
+        @descriptions.each_value do |desc|
           add_routes_info(desc)
         end
         @descriptions
       end
 
       def add_routes_info(desc)
-        api_prefix = Apipie.api_base_url.sub(/\/$/, '')
+        api_prefix = Apipie.api_base_url.sub(%r{/$},"")
         desc[:api] = Apipie::Extractor.apis_from_routes[[desc[:controller].name, desc[:action]]]
         if desc[:api]
           desc[:params].each do |name, param|

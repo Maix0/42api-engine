@@ -7,11 +7,8 @@ module Apipie
 
     layout Apipie.configuration.layout
 
-    around_filter :set_script_name
-    # before_filter :authenticate
-    
-    # skip_authentication
-    
+    around_action :set_script_name
+    before_action :authenticate
 
     def authenticate
       if Apipie.configuration.authenticate
@@ -50,6 +47,11 @@ module Apipie
 
       get_format
 
+      if params[:type].to_s == 'swagger' && params[:format].to_s == 'json'
+        head :forbidden and return if Apipie.configuration.authorize
+        should_render_swagger = true
+      end
+
       respond_to do |format|
 
         if Apipie.configuration.use_cache?
@@ -59,12 +61,22 @@ module Apipie
 
         @language = get_language
 
-        Apipie.load_documentation if Apipie.configuration.reload_controllers? || (Rails.version.to_i >= 4.0 && !Rails.application.config.eager_load)
+        Apipie.load_documentation if Apipie.configuration.reload_controllers? || !Rails.application.config.eager_load
 
         I18n.locale = @language
-        @doc = Apipie.to_json(params[:version], params[:resource], params[:method], @language)
 
-        @doc = authorized_doc
+        if should_render_swagger
+          prev_warning_value = Apipie.configuration.generator.swagger.suppress_warnings
+          begin
+            Apipie.configuration.generator.swagger.suppress_warnings = true
+            @doc = Apipie.to_swagger_json(params[:version], params[:resource], params[:method], @language)
+          ensure
+            Apipie.configuration.generator.swagger.suppress_warnings = prev_warning_value
+          end
+        else
+          @doc = Apipie.to_json(params[:version], params[:resource], params[:method], @language)
+          @doc = authorized_doc
+        end
 
         format.json do
           if @doc
@@ -186,44 +198,58 @@ module Apipie
     helper_method :heading
 
     def get_language
-      lang = nil
+      return nil unless Apipie.configuration.translate
+      lang = Apipie.configuration.default_locale
       [:resource, :method, :version].each do |par|
-        if params[par]
-          splitted = params[par].split('.')
-          if splitted.length > 1 && Apipie.configuration.languages.include?(splitted.last)
-            lang = splitted.last
-            params[par].sub!(".#{lang}", '')
-          end
+        next unless params[par]
+        splitted = params[par].split('.')
+        if splitted.length > 1 && (Apipie.configuration.languages.include?(splitted.last) || Apipie.configuration.default_locale == splitted.last)
+          lang = splitted.last
+          params[par].sub!(".#{lang}", '')
         end
       end
       lang
     end
 
     def authorized_doc
-
+      return if @doc.nil?
       return @doc unless Apipie.configuration.authorize
 
       new_doc = { :docs => @doc[:docs].clone }
 
-      new_doc[:docs][:resources] = @doc[:docs][:resources].select do |k, v|
-        if instance_exec(k, nil, v, &Apipie.configuration.authorize)
-          v[:methods] = v[:methods].select do |h|
-            instance_exec(k, h[:name], h, &Apipie.configuration.authorize)
-          end
-          true
-        else
-          false
+      new_doc[:docs][:resources] = if @doc[:docs][:resources].kind_of?(Array)
+        @doc[:docs][:resources].select do |resource|
+          authorize_resource(resource)
+        end
+      else
+        @doc[:docs][:resources].select do |_resource_id, resource|
+          authorize_resource(resource)
         end
       end
 
       new_doc
     end
 
+    def authorize_resource resource
+      if instance_exec(resource[:id], nil, resource, &Apipie.configuration.authorize)
+        resource[:methods] = resource[:methods].select do |m|
+          instance_exec(resource[:id], m[:name], m, &Apipie.configuration.authorize)
+        end
+        true
+      else
+        false
+      end
+    end
+
     def get_format
       [:resource, :method, :version].each do |par|
-        if params[par]
-          params[:format] = :html unless params[par].sub!('.html', '').nil?
-          params[:format] = :json unless params[par].sub!('.json', '').nil?
+        next unless params[par]
+        [:html, :json].each do |format|
+          extension = ".#{format}"
+          if params[par].include?(extension)
+            params[par] = params[par].sub(extension, '')
+            params[:format] = format
+          end
         end
       end
       request.format = params[:format] if params[:format]
@@ -231,29 +257,15 @@ module Apipie
 
     def render_from_cache
       path = Apipie.configuration.doc_base_url.dup
-      # some params can contain dot, but only one in row
-      if [:resource, :method, :format, :version].any? { |p| params[p].to_s.gsub(".", "") =~ /\W/ || params[p].to_s =~ /\.\./ }
-        head :bad_request and return
-      end
-
       path << "/" << params[:version] if params[:version].present?
       path << "/" << params[:resource] if params[:resource].present?
       path << "/" << params[:method] if params[:method].present?
-      if params[:format].present?
-        path << ".#{params[:format]}"
-      else
-        path << ".html"
-      end
-
-      # we sanitize the params before so in ideal case, this condition
-      # will be never satisfied. It's here for cases somebody adds new
-      # param into the path later and forgets about sanitation.
-      if path =~ /\.\./
-        head :bad_request and return
-      end
+      # Sanitize path against directory traversal attacks (e.g. ../../foo)
+      # by turning path into an absolute path before appending it to the cache dir
+      path = File.expand_path("#{path}.#{request.format.symbol}", '/')
 
       cache_file = File.join(Apipie.configuration.cache_dir, path)
-      if File.exists?(cache_file)
+      if File.exist?(cache_file)
         content_type = case params[:format]
                        when "json" then "application/json"
                        else "text/html"

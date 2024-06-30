@@ -1,33 +1,24 @@
-require 'set'
 module Apipie
   class MethodDescription
-    class Api
-      attr_accessor :short_description, :path, :http_method, :from_routes, :options
-
-      def initialize(method, path, desc, options)
-        @http_method = method.to_s
-        @path = path
-        @short_description = desc
-        @from_routes = options[:from_routes]
-        @options = options
-      end
-    end
-
-    attr_reader :full_description, :method, :resource, :apis, :examples, :see, :formats, :metadata, :headers, :show
+    attr_reader :full_description, :method, :resource, :apis, :examples, :see, :formats, :headers, :show
+    attr_accessor :metadata
 
     def initialize(method, resource, dsl_data)
       @method = method.to_s
       @resource = resource
       @from_concern = dsl_data[:from_concern]
-      @apis = api_data(dsl_data).map do |mthd, path, desc, opts|
-        MethodDescription::Api.new(mthd, concern_subst(path), concern_subst(desc), opts)
-      end
+      @apis = ApisService.new(resource, method, dsl_data).call
 
-      desc = dsl_data[:description] || ''
-      @full_description = Apipie.markup_to_html(desc)
+      @full_description = dsl_data[:description] || ''
 
       @errors = dsl_data[:errors].map do |args|
         Apipie::ErrorDescription.from_dsl_data(args)
+      end
+
+      @tag_list = dsl_data[:tag_list]
+
+      @returns = dsl_data[:returns].map do |code,args|
+        Apipie::ResponseDescription.from_dsl_data(self, code, args)
       end
 
       @see = dsl_data[:see].map do |args|
@@ -42,14 +33,15 @@ module Apipie
 
       @params_ordered = dsl_data[:params].map do |args|
         Apipie::ParamDescription.from_dsl_data(self, args)
-      end
+      end.reject(&:response_only?)
+
       @params_ordered = ParamDescription.unify(@params_ordered)
       @headers = dsl_data[:headers]
 
       @show = if dsl_data.key? :show
-                dsl_data[:show]
-              else
-                true
+        dsl_data[:show]
+      else
+        true
       end
     end
 
@@ -59,6 +51,10 @@ module Apipie
 
     def params
       params_ordered.reduce(ActiveSupport::OrderedHash.new) { |h, p| h[p.name] = p; h }
+    end
+
+    def params_ordered_self
+      @params_ordered
     end
 
     def params_ordered
@@ -75,6 +71,34 @@ module Apipie
 
       merge_params(all_params, @params_ordered)
       all_params.find_all(&:validator)
+    end
+
+    def returns_self
+      @returns
+    end
+
+    def tag_list
+      all_tag_list = []
+      parent = Apipie.get_resource_description(@resource.controller.superclass)
+
+      # get tags from parent resource description
+      parent_tags = [parent, @resource].compact.flat_map(&:_tag_list_arg)
+      Apipie::TagListDescription.new((parent_tags + @tag_list).uniq.compact)
+    end
+
+    def returns
+      all_returns = []
+      parent = Apipie.get_resource_description(@resource.controller.superclass)
+
+      # get response descriptions from parent resource description
+      [parent, @resource].compact.each do |resource|
+        resource_returns = resource._returns_args.map do |code, args|
+          Apipie::ResponseDescription.from_dsl_data(self, code, args)
+        end
+        merge_returns(all_returns, resource_returns)
+      end
+
+      merge_returns(all_returns, @returns)
     end
 
     def errors
@@ -117,10 +141,10 @@ module Apipie
       raise 'lol'
       @apis.each.collect do |api|
         {
-          api_url: create_api_url(api),
-          http_method: api.http_method.to_s,
-          short_description: Apipie.app.translate(api.short_description, lang),
-          deprecated: api.options[:deprecated]
+          :api_url => create_api_url(api),
+          :http_method => api.http_method.to_s,
+          :short_description => Apipie.app.translate(api.short_description, lang),
+          :deprecated => resource._deprecated || api.options[:deprecated]
         }
       end
     end
@@ -133,18 +157,19 @@ module Apipie
 
     def to_json(lang = nil)
       {
-        doc_url: doc_url,
-        name: @method,
-        apis: method_apis_to_json(lang),
-        formats: formats,
-        full_description: Apipie.app.translate(@full_description, lang),
-        errors: errors.map(&:to_json),
-        params: params_ordered.map { |param| param.to_json(lang) }.flatten,
-        examples: @examples,
-        metadata: @metadata,
-        see: see.map(&:to_json),
-        headers: headers,
-        show: @show
+        :doc_url => doc_url,
+        :name => @method,
+        :apis => method_apis_to_json(lang),
+        :formats => formats,
+        :full_description => Apipie.markup_to_html(Apipie.app.translate(@full_description, lang)),
+        :errors => errors.map{ |error| error.to_json(lang) }.flatten,
+        :params => params_ordered.map{ |param| param.to_json(lang) }.flatten,
+        :returns => @returns.map{ |return_item| return_item.to_json(lang) }.flatten,
+        :examples => @examples,
+        :metadata => @metadata,
+        :see => see.map(&:to_json),
+        :headers => headers,
+        :show => @show
       }
     end
 
@@ -171,12 +196,22 @@ module Apipie
         ret.concat(api_from_routes)
       end
       ret
+    def method_name
+      @method
     end
+
+    private
 
     def merge_params(params, new_params)
       new_param_names = Set.new(new_params.map(&:name))
       params.delete_if { |p| new_param_names.include?(p.name) }
       params.concat(new_params)
+    end
+
+    def merge_returns(returns, new_returns)
+      new_return_codes = Set.new(new_returns.map(&:code))
+      returns.delete_if { |p| new_return_codes.include?(p.code) }
+      returns.concat(new_returns)
     end
 
     def load_recorded_examples

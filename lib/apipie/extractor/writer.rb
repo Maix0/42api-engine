@@ -3,9 +3,75 @@ require 'set'
 module Apipie
   module Extractor
     class Writer
+      class << self
+        def compressed
+          Apipie.configuration.compress_examples
+        end
+
+        def update_action_description(controller, action)
+          updater = ActionDescriptionUpdater.new(controller, action)
+          yield updater
+          updater.write!
+        rescue ActionDescriptionUpdater::ControllerNotFound
+          logger.warn("REST_API: Couldn't find controller file for #{controller}")
+        rescue ActionDescriptionUpdater::ActionNotFound
+          logger.warn("REST_API: Couldn't find action #{action} in #{controller}")
+        end
+
+        def write_recorded_examples(examples)
+          FileUtils.mkdir_p(File.dirname(examples_file))
+          content = serialize_examples(examples)
+          content = Zlib::Deflate.deflate(content).force_encoding('utf-8') if compressed
+          File.open(examples_file, 'w') { |f| f << content }
+        end
+
+        def load_recorded_examples
+          return {} unless File.exist?(examples_file)
+          load_json_examples
+        end
+
+        def examples_file
+          pure_path = Rails.root.join(
+            Apipie.configuration.doc_path, 'apipie_examples.json'
+          )
+          zipped_path = pure_path.to_s + '.gz'
+          return zipped_path if compressed
+          pure_path.to_s
+        end
+
+        protected
+
+        def serialize_examples(examples)
+          JSON.pretty_generate(
+            OrderedHash[*examples.sort_by(&:first).flatten(1)]
+          )
+        end
+
+        def deserialize_examples(examples_string)
+          examples = JSON.parse(examples_string)
+          return {} if examples.nil?
+          examples.each_value do |records|
+            records.each do |record|
+              record['verb'] = record['verb'].to_sym if record['verb']
+            end
+          end
+        end
+
+        def load_json_examples
+          raw = IO.read(examples_file)
+          raw = Zlib::Inflate.inflate(raw).force_encoding('utf-8') if compressed
+          deserialize_examples(raw)
+        end
+
+        def logger
+          Extractor.logger
+        end
+      end
+
       def initialize(collector)
         @collector = collector
       end
+
 
       def write_examples
         merged_examples = merge_old_new_examples
@@ -14,7 +80,7 @@ module Apipie
 
       def write_docs
         descriptions = @collector.finalize_descriptions
-        descriptions.each do |_, desc|
+        descriptions.each_value do |desc|
           if desc[:api].empty?
             logger.warn("REST_API: Couldn't find any path for #{desc_to_s(desc)}")
             next
@@ -25,45 +91,9 @@ module Apipie
         end
       end
 
-      def self.update_action_description(controller, action)
-        updater = ActionDescriptionUpdater.new(controller, action)
-        yield updater
-        updater.write!
-      rescue ActionDescriptionUpdater::ControllerNotFound
-        logger.warn("REST_API: Couldn't find controller file for #{controller}")
-      rescue ActionDescriptionUpdater::ActionNotFound
-        logger.warn("REST_API: Couldn't find action #{action} in #{controller}")
-      end
-
-      def self.write_recorded_examples(examples)
-        examples_file = self.examples_file
-        FileUtils.mkdir_p(File.dirname(examples_file))
-        File.open(examples_file, 'w') do |f|
-          f << JSON.pretty_generate(OrderedHash[*examples.sort_by(&:first).flatten(1)])
-        end
-      end
-
-      def self.load_recorded_examples
-        examples_file = self.examples_file
-        return load_json_examples if File.exist?(examples_file)
-        {}
-      end
-
-      def self.examples_file
-        File.join(Rails.root, Apipie.configuration.doc_path, 'apipie_examples.json')
-      end
 
       protected
 
-      def self.load_json_examples
-        examples = JSON.load(IO.read(examples_file))
-        return {} if examples.nil?
-        examples.each do |_method, records|
-          records.each do |record|
-            record['verb'] = record['verb'].to_sym if record['verb']
-          end
-        end
-      end
 
       def desc_to_s(description)
         "#{description[:controller].name}##{description[:action]}"
@@ -72,22 +102,28 @@ module Apipie
       def ordered_call(call)
         call = call.stringify_keys
         ordered_call = OrderedHash.new
-        %w(title verb path versions query request_data response_data code show_in_doc recorded).each do |k|
+        %w[title verb path versions query request_data response_data code show_in_doc recorded].each do |k|
           next unless call.key?(k)
           ordered_call[k] = case call[k]
-                       when ActiveSupport::HashWithIndifferentAccess
-                         # UploadedFiles break the to_json call, turn them into a string so they don't break
-                         call[k].each do |pkey, pval|
-                           if (pval.is_a?(Rack::Test::UploadedFile) || pval.is_a?(ActionDispatch::Http::UploadedFile))
-                             call[k][pkey] = "<FILE CONTENT '#{pval.original_filename}'>"
-                           end
-                         end
-                         JSON.parse(call[k].to_json) # to_hash doesn't work recursively and I'm too lazy to write the recursion:)
-                       else
-                         call[k]
-                       end
+                     when ActiveSupport::HashWithIndifferentAccess
+                       convert_file_value(call[k]).to_hash
+                     else
+                       call[k]
+                     end
+      end
+        return ordered_call
+      end
+
+      def convert_file_value hash
+        hash.each do |k, v|
+          case v
+          when Rack::Test::UploadedFile, ActionDispatch::Http::UploadedFile
+            hash[k] = "<FILE CONTENT '#{v.original_filename}'>"
+          when Hash
+            hash[k] = convert_file_value(v)
+          end
         end
-        ordered_call
+        hash
       end
 
       def load_recorded_examples
@@ -167,10 +203,6 @@ module Apipie
 
       def logger
         self.class.logger
-      end
-
-      def self.logger
-        Extractor.logger
       end
 
       def showable_in_doc?(call)
@@ -290,8 +322,8 @@ module Apipie
           desc ||= case @action.to_s
                    when 'show', 'create', 'update', 'destroy'
                      name = name.singularize
-                     "#{@action.capitalize} #{name =~ /^[aeiou]/ ? 'an' : 'a'} #{name}"
-                   when 'index'
+                     "#{@action.capitalize} #{/^[aeiou]/.match?(name) ? 'an' : 'a'} #{name}"
+                   when "index"
                      "List #{name}"
                    end
 
@@ -307,11 +339,11 @@ module Apipie
         params.sort_by { |n, _| n }.each do |(name, desc)|
           desc[:type] = (desc[:type] && desc[:type].first) || Object
           code << "#{indent}param"
-          code << if name =~ /\W/
-                    " :'#{name}'"
-                  else
-                    " :#{name}"
-                  end
+          if /\W/.match?(name)
+            code << " :'#{name}'"
+          else
+            code << " :#{name}"
+          end
           code << ", #{desc[:type].inspect}"
           code << ', allow_nil: true' if desc[:allow_nil]
           code << ', required: true' if desc[:required]
@@ -358,14 +390,18 @@ module Apipie
         lines_to_add = []
         block_level = 0
         ensure_line_breaks(controller_content.lines).first(action_line).reverse_each do |line|
-          block_level += 1 if line =~ /\s*\bend\b\s*/
+          if /\s*\bend\b\s*/.match?(line)
+            block_level += 1
+          end
           if block_level > 0
             lines_to_add << line
           else
             added_lines << line
           end
-          break if line =~ /\s*\b(module|class|def)\b /
-          next unless line =~ /do\s*(\|.*?\|)?\s*$/
+          if /\s*\b(module|class|def)\b /.match?(line)
+            break
+          end
+          next unless /do\s*(\|.*?\|)?\s*$/.match?(line)
           block_level -= 1
           if block_level == 0
             added_lines.concat(lines_to_add)
@@ -376,14 +412,14 @@ module Apipie
       end
 
       # this method would be totally useless unless some clever guy
-      # desided that it would be great idea to change a behavior of
+      # decided that it would be great idea to change a behavior of
       # "".lines method to not include end of lines.
       #
       # For more details:
       #   https://github.com/puppetlabs/puppet/blob/0dc44695/lib/puppet/util/monkey_patches.rb
       def ensure_line_breaks(lines)
         if lines.to_a.size > 1 && lines.first !~ /\n\Z/
-          lines.map { |l| l !~ /\n\Z/ ? (l << "\n") : l }.to_enum
+          lines.map { |l| !/\n\Z/.match?(l) ? (l << "\n") : l }.to_enum
         else
           lines
         end
